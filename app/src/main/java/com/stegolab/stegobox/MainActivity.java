@@ -70,6 +70,9 @@ public class MainActivity extends AppCompatActivity {
     private static final int REQ_OUT_DIR = 6;
     private static final int REQ_PICK_DIR = 7;
     private static final int REQ_ADD_IMAGE = 8;
+    private static final int REQ_GAL_COVER = 9;
+    private static final int REQ_GAL_STEGO = 10;
+    private static final int REQ_GAL_FILES = 11;
 
     private static final String[] CARRIERS = {"尾部追加（容量大，需无损传输）", "像素 LSB（改动像素，需 PNG）"};
     private static final String[] CIPHERS = {"AES-256-GCM", "ChaCha20-Poly1305", "SM4-GCM (国密)", "不加密"};
@@ -87,8 +90,6 @@ public class MainActivity extends AppCompatActivity {
     private int selCarrier, selCipher, selKeyMode, selRecv;
     private volatile boolean busy = false;
     private int pendingPickReq = REQ_COVER;
-    private ActivityResultLauncher<PickVisualMediaRequest> photoPicker;
-    private ActivityResultLauncher<PickVisualMediaRequest> multiPhotoPicker;
     private SharedPreferences prefs;
     private Uri outDirUri;
     private byte[] lastHash;
@@ -163,28 +164,8 @@ public class MainActivity extends AppCompatActivity {
         btnExtract.setOnClickListener(v -> pickStego());
         btnGrantAll.setOnClickListener(v -> requestAllFilesPermission());
 
-        // System photo picker (Android 13+ / GMS back-port). Falls back to ACTION_PICK in pickImage().
-        photoPicker = registerForActivityResult(new ActivityResultContracts.PickVisualMedia(), uri -> {
-            if (uri == null) return;
-            if (pendingPickReq == REQ_STEGO) {
-                setBusy(true, "读取图片…");
-                performExtract(uri);
-            } else {
-                coverUri = uri;
-                txtCover.setText(nameOf(uri));
-            }
-        });
-
-        // Multi-select photo picker -> appended to the payload list
-        multiPhotoPicker = registerForActivityResult(
-                new ActivityResultContracts.PickMultipleVisualMedia(100), uris -> {
-                    if (uris == null || uris.isEmpty()) return;
-                    for (Uri u : uris) if (u != null) fileUris.add(u);
-                    txtFiles.setText(fileUris.size() + " 个文件");
-                    refreshFilesLabel();
-                    log("已选择 " + fileUris.size() + " 个文件");
-                    toast("已选择 " + fileUris.size() + " 个文件");
-                });
+        // Image picking is handled by the built-in GalleryActivity (see openGallery),
+        // which gives a thumbnail grid + real multi-select and never opens the system file manager.
 
         findViewById(R.id.btnPickImages).setOnClickListener(v -> pickImagesFromGallery());
 
@@ -217,82 +198,48 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void pickCover() {
-        pendingPickReq = REQ_COVER;
-        pickImage();
+        if (busy) { toast("正在处理，请稍候…"); return; }
+        openGallery(false, REQ_GAL_COVER);
     }
 
     private void pickStego() {
         if (busy) { toast("正在处理，请稍候…"); return; }
-        pendingPickReq = REQ_STEGO;
-        pickImage();
+        openGallery(false, REQ_GAL_STEGO);
     }
 
-    /**
-     * Prefer the system photo picker (Android 13+, or back-ported via Play services on 11+),
-     * which shows a thumbnail gallery. Fall back to ACTION_PICK, which also opens a gallery
-     * app rather than the documents/file manager UI.
-     */
-    private void pickImage() {
-        // 1) system photo picker (Android 13+, or GMS back-port)
+    /** Launch the built-in gallery: thumbnail grid, real multi-select, never the file manager. */
+    private void openGallery(boolean multi, int req) {
+        Intent i = new Intent(this, GalleryActivity.class);
+        i.putExtra(GalleryActivity.EXTRA_MULTI, multi);
         try {
-            if (photoPicker != null
-                    && ActivityResultContracts.PickVisualMedia.isPhotoPickerAvailable(this)) {
-                photoPicker.launch(new PickVisualMediaRequest.Builder()
-                        .setMediaType(ActivityResultContracts.PickVisualMedia.ImageOnly.INSTANCE)
-                        .build());
-                return;
+            startActivityForResult(i, req);
+        } catch (Throwable t) {
+            fail("无法打开相册", t);
+        }
+    }
+
+    /** Reads the ArrayList&lt;Uri&gt; returned by GalleryActivity. */
+    @SuppressWarnings("unchecked")
+    private ArrayList<Uri> readUriList(Intent data) {
+        if (data == null) return null;
+        try {
+            if (Build.VERSION.SDK_INT >= 33) {
+                return data.getParcelableArrayListExtra(GalleryActivity.RESULT_URIS, Uri.class);
             }
         } catch (Throwable ignored) {
         }
-        // 2) ACTION_PICK over the MediaStore image collection -> opens the GALLERY app.
-        launchGalleryPick(pendingPickReq);
-    }
-
-    /**
-     * Open the gallery to pick ONE image.
-     * ACTION_PICK with a MediaStore collection uri is the documented "pick from gallery" intent;
-     * the type-only variant gets routed to the documents/file-manager UI on some OEM builds.
-     */
-    private void launchGalleryPick(int req) {
         try {
-            Intent pick = new Intent(Intent.ACTION_PICK, MediaStore.Images.Media.EXTERNAL_CONTENT_URI);
-            pick.setType("image/*");
-            startActivityForResult(pick, req);
-            return;
+            Object o = data.getSerializableExtra(GalleryActivity.RESULT_URIS);
+            if (o instanceof ArrayList) return new ArrayList<>((ArrayList<Uri>) o);
         } catch (Throwable ignored) {
         }
-        try {
-            Intent pick2 = new Intent(Intent.ACTION_PICK);
-            pick2.setType("image/*");
-            startActivityForResult(pick2, req);
-            return;
-        } catch (Throwable ignored) {
-        }
-        try {
-            Intent get = new Intent(Intent.ACTION_GET_CONTENT);
-            get.setType("image/*");
-            startActivityForResult(get, req);
-        } catch (Throwable t) {
-            fail("无法打开图片选择器", t);
-        }
+        return null;
     }
 
-    /** Add photos from the gallery to the payload list. */
+    /** Add photos from the gallery to the payload list (multi-select). */
     private void pickImagesFromGallery() {
         if (busy) { toast("正在处理，请稍候…"); return; }
-        // 1) real multi-select when the system photo picker exists (Android 13+ / GMS backport)
-        try {
-            if (multiPhotoPicker != null
-                    && ActivityResultContracts.PickVisualMedia.isPhotoPickerAvailable(this)) {
-                multiPhotoPicker.launch(new PickVisualMediaRequest.Builder()
-                        .setMediaType(ActivityResultContracts.PickVisualMedia.ImageOnly.INSTANCE)
-                        .build());
-                return;
-            }
-        } catch (Throwable ignored) {
-        }
-        // 2) otherwise: ACTION_PICK over the MediaStore image collection -> opens the GALLERY app.
-        launchGalleryPick(REQ_ADD_IMAGE);
+        openGallery(true, REQ_GAL_FILES);
     }
 
     // ---------------------------------------------------------------- hide
@@ -410,6 +357,27 @@ public class MainActivity extends AppCompatActivity {
         if (resultCode != Activity.RESULT_OK || data == null) {
             // cancelled (or empty result): never leave the UI stuck in the "busy" state
             if (resultCode != Activity.RESULT_OK) setBusy(false, null);
+            return;
+        }
+
+        // Built-in gallery results: the picked URIs arrive in an extra, with no data uri.
+        if (requestCode == REQ_GAL_COVER || requestCode == REQ_GAL_STEGO || requestCode == REQ_GAL_FILES) {
+            ArrayList<Uri> uris = readUriList(data);
+            if (uris == null || uris.isEmpty()) return;
+            if (requestCode == REQ_GAL_COVER) {
+                coverUri = uris.get(0);
+                txtCover.setText(nameOf(coverUri));
+                log("封面：" + nameOf(coverUri));
+            } else if (requestCode == REQ_GAL_STEGO) {
+                setBusy(true, "读取图片…");
+                performExtract(uris.get(0));
+            } else {
+                fileUris.addAll(uris);
+                txtFiles.setText(fileUris.size() + " 个文件");
+                refreshFilesLabel();
+                log("已添加 " + uris.size() + " 张（共 " + fileUris.size() + " 个文件）");
+                toast("已添加 " + uris.size() + " 张");
+            }
             return;
         }
 

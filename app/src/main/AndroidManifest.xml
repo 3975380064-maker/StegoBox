@@ -15,6 +15,9 @@
         android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
         tools:ignore="ScopedStorage" />
 
+    <!-- Android 13+: reading images for the built-in gallery -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+
     <application
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
@@ -30,6 +33,12 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Built-in gallery picker: thumbnail grid + multi-select, never the system file manager -->
+        <activity
+            android:name=".GalleryActivity"
+            android:exported="false"
+            android:label="选择图片" />
     </application>
 
 </manifest>
