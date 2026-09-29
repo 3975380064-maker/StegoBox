@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="110dp">
+
+    <ImageView
+        android:id="@+id/thumb"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#22000000"
+        android:contentDescription="thumbnail"
+        android:scaleType="centerCrop" />
+
+    <ImageView
+        android:id="@+id/check"
+        android:layout_width="26dp"
+        android:layout_height="26dp"
+        android:layout_gravity="top|end"
+        android:layout_margin="4dp"
+        android:background="#CC000000"
+        android:padding="3dp"
+        android:contentDescription="selected"
+        android:src="@drawable/ic_check"
+        android:visibility="gone" />
+</FrameLayout>

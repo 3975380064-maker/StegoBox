@@ -1,0 +1,21 @@
+# Android / Gradle
+*.iml
+.gradle/
+/build/
+/app/build/
+/captures/
+local.properties
+.externalNativeBuild/
+.cxx/
+
+# IDE / OS
+.idea/
+.DS_Store
+
+# Signing material — NEVER commit a real keystore
+keystore.jks
+*.jks
+*.keystore
+
+# Release binaries live in GitHub Releases, not in the source tree
+*.apk

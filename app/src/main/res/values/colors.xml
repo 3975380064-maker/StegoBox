@@ -1,0 +1,28 @@
+<resources>
+    <!-- ===== Material 3 tokens (light) — neutral surfaces + muted steel blue ===== -->
+    <color name="m3_primary">#3B6EA5</color>
+    <color name="m3_on_primary">#FFFFFF</color>
+    <color name="m3_primary_container">#D6E3F3</color>
+    <color name="m3_on_primary_container">#0B2440</color>
+
+    <color name="m3_secondary">#5A6B7B</color>
+    <color name="m3_on_secondary">#FFFFFF</color>
+    <color name="m3_secondary_container">#DCE2E8</color>
+    <color name="m3_on_secondary_container">#17222C</color>
+
+    <color name="m3_surface">#FCFCFD</color>
+    <color name="m3_on_surface">#1A1C1E</color>
+    <color name="m3_surface_variant">#E3E5E8</color>
+    <color name="m3_on_surface_variant">#45474A</color>
+
+    <color name="m3_surface_container_lowest">#FFFFFF</color>
+    <color name="m3_surface_container_low">#F7F8FA</color>
+    <color name="m3_surface_container">#F2F3F5</color>
+    <color name="m3_surface_container_high">#ECEEF1</color>
+    <color name="m3_surface_container_highest">#E6E8EB</color>
+
+    <color name="m3_outline">#74777A</color>
+    <color name="m3_outline_variant">#C6C8CB</color>
+    <color name="m3_inverse_on_surface">#F1F1F4</color>
+    <color name="m3_inverse_surface">#2F3133</color>
+</resources>
