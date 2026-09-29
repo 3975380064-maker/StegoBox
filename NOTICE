@@ -1,0 +1,33 @@
+StegoBox / stego-lab
+Copyright (c) 2026 the authors
+
+This software is distributed under the Apache License, Version 2.0 (see LICENSE),
+WITH AN ADDITIONAL CONDITION:
+
+    NON-COMMERCIAL USE ONLY.
+
+You may use, modify and redistribute this software for personal, educational,
+research or other non-commercial purposes only. Any commercial use — including
+selling it, offering it as a paid service, or bundling it into a commercial
+product — is NOT permitted without a separate written licence from the authors.
+
+This additional condition is a permitted "additional restriction" mechanism used
+alongside Apache-2.0 (comparable to the well-known Commons Clause pattern). The
+resulting licence is therefore NOT an OSI-approved open-source licence.
+
+If you need a commercial licence, contact the authors.
+
+-----------------------------------------------------------------------
+
+本软件以 Apache License 2.0 发布（见 LICENSE），并附加以下条件：
+
+    仅限非商业用途。
+
+允许个人使用、学习、研究及其他非商业用途的修改与再分发；
+未经作者书面许可，禁止任何商业用途 —— 包括但不限于售卖本软件、
+将其作为付费服务提供、或集成进商业产品。
+
+该附加条件是与 Apache-2.0 并用的合法“附加限制”机制（与业界常见的
+Commons Clause 模式一致），因此本项目的授权**不属于 OSI 认可的开源协议**。
+
+如需商业授权，请联系作者。

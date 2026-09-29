@@ -3,8 +3,9 @@
 **Hide any file inside an image — with real authenticated encryption.**
 **把任意文件藏进一张图片里 —— 带真正可认证的加密。**
 
-> ⚠️ **License: CC BY-NC-SA 4.0 — NON-COMMERCIAL USE ONLY.**
-> **协议：CC BY-NC-SA 4.0 —— 仅限非商业用途，禁止商用。** See [LICENSE](LICENSE).
+> ⚠️ **License: Apache-2.0 — WITH AN ADDITIONAL NON-COMMERCIAL RESTRICTION
+> (see [NOTICE](NOTICE)). Not an OSI-approved open-source licence.**
+> **协议：Apache-2.0，但附加「禁止商用」条款（详见 [NOTICE](NOTICE)），因此不属于标准开源许可。**
 
 ---
 
@@ -184,9 +185,9 @@ payload（= 密文||标签；不加密时即明文）
 
 ## License / 协议
 
-**Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0)**
+**Apache License 2.0 + 附加「禁止商用」条款 / with an additional non-commercial condition**
 
-- ✅ 允许：个人使用、学习研究、非商业分发（需署名并以相同方式共享）
+- ✅ 允许：个人使用、学习研究、非商业修改与再分发（需保留 NOTICE 与署名）
 - ❌ **禁止：任何商业用途**（包括售卖、付费服务、商业产品内置等）
 
-完整条款见 [LICENSE](LICENSE)。商业授权请联系作者。
+完整条款见 [LICENSE](LICENSE)（Apache-2.0）与 [NOTICE](NOTICE)（非商业限制）。商业授权请联系作者。
