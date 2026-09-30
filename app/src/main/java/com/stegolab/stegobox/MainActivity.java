@@ -44,6 +44,7 @@ import com.stegolab.stegobox.container.Envelope;
 import com.stegolab.stegobox.crypto.Crypto;
 import com.stegolab.stegobox.crypto.Kdf;
 import com.stegolab.stegobox.stego.LsbStego;
+import com.stegolab.stegobox.stego.Steganalysis;
 import com.stegolab.stegobox.stego.TailAppend;
 import com.stegolab.stegobox.util.ZipUtil;
 
@@ -93,6 +94,7 @@ public class MainActivity extends AppCompatActivity {
     private SharedPreferences prefs;
     private Uri outDirUri;
     private byte[] lastHash;
+    private Steganalysis.Result lastAnalysis;
 
     private Uri coverUri;
     private final List<Uri> fileUris = new ArrayList<>();
@@ -461,6 +463,7 @@ public class MainActivity extends AppCompatActivity {
         Bitmap bmp = BitmapFactory.decodeByteArray(cover, 0, cover.length);
         if (bmp == null) throw new IllegalArgumentException("无法解码封面图片");
         Bitmap stego = LsbStego.embed(flatten(bmp), env.serialize());
+        lastAnalysis = Steganalysis.analyze(stego);   // honest detectability report
         ByteArrayOutputStream bos = new ByteArrayOutputStream();
         stego.compress(Bitmap.CompressFormat.PNG, 100, bos);
         return bos.toByteArray();
@@ -474,6 +477,17 @@ public class MainActivity extends AppCompatActivity {
                     + " | 接收=" + (pEnvKeyMode == Envelope.KEY_EMBEDDED ? "自动输入" : "手动输入"));
             log("明文 " + pPlain.length + " 字节 | SHA-256 " + Kdf.hex(lastHash).substring(0, 16) + "…");
             log("输出：" + where);
+            if (pCarrier == Envelope.CARRIER_LSB) {
+                if (lastAnalysis == null) {
+                    log("隐蔽性：未分析");
+                } else {
+                    log("隐蔽性（χ²/RS 类筛查）：" + lastAnalysis.verdict());
+                    log("  χ²=" + String.format(java.util.Locale.US, "%.0f", lastAnalysis.chiSquare)
+                            + "  dof=" + lastAnalysis.dof);
+                }
+            } else {
+                log("隐蔽性：尾部追加不修改像素，χ² 分析无意义（但载荷本身可被 strings 直接看到）");
+            }
             if (pEnvKeyMode != Envelope.KEY_NONE) {
                 log(pEnvKeyMode == Envelope.KEY_EMBEDDED
                         ? "口令已填入「口令」栏（对方无需输入；口令随文件保存，无安全性）。"
