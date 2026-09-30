@@ -195,6 +195,7 @@ public class MainActivity extends AppCompatActivity {
 
         log("就绪。算法：" + Crypto.name(Crypto.AES) + " / " + Crypto.name(Crypto.CHACHA)
                 + " / " + Crypto.name(Crypto.SM4));
+        log("作者：喵喵喵 | 项目地址：https://github.com/3975380064-maker/StegoBox");
     }
 
     @Override
