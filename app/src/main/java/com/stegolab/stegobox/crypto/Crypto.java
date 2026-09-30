@@ -1,12 +1,18 @@
 package com.stegolab.stegobox.crypto;
 
 import org.bouncycastle.crypto.BlockCipher;
+import org.bouncycastle.crypto.InvalidCipherTextException;
 import org.bouncycastle.crypto.engines.AESEngine;
 import org.bouncycastle.crypto.engines.SM4Engine;
+import org.bouncycastle.crypto.modes.AEADCipher;
 import org.bouncycastle.crypto.modes.ChaCha20Poly1305;
 import org.bouncycastle.crypto.modes.GCMBlockCipher;
 import org.bouncycastle.crypto.params.AEADParameters;
 import org.bouncycastle.crypto.params.KeyParameter;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 
 /**
  * Unified AEAD layer over Bouncy Castle's low-level API.
@@ -97,5 +103,67 @@ public final class Crypto {
         byte[] t = new byte[n];
         System.arraycopy(a, 0, t, 0, n);
         return t;
+    }
+
+    // ------------------------------------------------------------------ streaming
+
+    private static final int CHUNK = 64 * 1024;
+
+    private static AEADCipher newAead(int cipher, byte[] key, byte[] nonce, byte[] aad,
+                                           boolean forEncryption) {
+        AEADCipher c;
+        if (cipher == CHACHA) {
+            c = new ChaCha20Poly1305();
+        } else if (cipher == AES) {
+            c = new GCMBlockCipher(new AESEngine());
+        } else {
+            c = new GCMBlockCipher(new SM4Engine());
+        }
+        c.init(forEncryption, new AEADParameters(new KeyParameter(key), MAC_BITS, nonce, aad));
+        return c;
+    }
+
+    /** Stream-encrypts {@code in} into {@code out} (ciphertext||tag). Memory use is O(CHUNK). */
+    public static void sealStream(int cipher, byte[] key, byte[] nonce, byte[] aad,
+                                  InputStream in, OutputStream out) throws IOException {
+        if (cipher == NONE) {
+            pipe(in, out);
+            return;
+        }
+        pump(newAead(cipher, key, nonce, aad, true), in, out);
+    }
+
+    /** Stream-decrypts {@code in} (ciphertext||tag, read to EOF) into {@code out}. */
+    public static void openStream(int cipher, byte[] key, byte[] nonce, byte[] aad,
+                                  InputStream in, OutputStream out) throws IOException {
+        if (cipher == NONE) {
+            pipe(in, out);
+            return;
+        }
+        pump(newAead(cipher, key, nonce, aad, false), in, out);
+    }
+
+    private static void pump(AEADCipher c, InputStream in, OutputStream out) throws IOException {
+        byte[] buf = new byte[CHUNK];
+        byte[] ob = new byte[CHUNK + 64];
+        int n;
+        try {
+            while ((n = in.read(buf)) > 0) {
+                int m = c.processBytes(buf, 0, n, ob, 0);
+                if (m > 0) out.write(ob, 0, m);
+            }
+            int m = c.doFinal(ob, 0);
+            if (m > 0) out.write(ob, 0, m);
+        } catch (InvalidCipherTextException e) {
+            throw new SecurityException("认证失败（密钥错误或数据被篡改）", e);
+        }
+        out.flush();
+    }
+
+    public static void pipe(InputStream in, OutputStream out) throws IOException {
+        byte[] buf = new byte[CHUNK];
+        int n;
+        while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+        out.flush();
     }
 }

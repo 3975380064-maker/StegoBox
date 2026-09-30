@@ -34,7 +34,8 @@ public final class ZipUtil {
         return bos.toByteArray();
     }
 
-    private static String unique(String name, Set<String> used) {
+    /** Makes {@code name} unique inside {@code used} by appending (2), (3), … */
+    public static String uniqueName(String name, Set<String> used) {
         if (used.add(name)) return name;
         int dot = name.lastIndexOf('.');
         String base = dot > 0 ? name.substring(0, dot) : name;
@@ -43,6 +44,10 @@ public final class ZipUtil {
             String cand = base + "(" + k + ")" + ext;
             if (used.add(cand)) return cand;
         }
+    }
+
+    private static String unique(String name, Set<String> used) {
+        return uniqueName(name, used);
     }
 
     public static Map<String, byte[]> unzip(byte[] data) throws IOException {

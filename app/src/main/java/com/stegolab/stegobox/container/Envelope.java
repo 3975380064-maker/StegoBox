@@ -4,6 +4,8 @@ import com.stegolab.stegobox.crypto.Crypto;
 import com.stegolab.stegobox.crypto.Kdf;
 
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.util.Arrays;
@@ -11,17 +13,18 @@ import java.util.Arrays;
 /**
  * Self-describing container envelope, version 3.
  *
- * Layout:
- *   magic(5 "SGBX3") ver(1) carrier(1) cipher(1) keyMode(1) iters(4 BE)
- *   salt(16) nonce(12) payloadLen(8 BE) plaintextSHA256(32)
- *   nameLen(2 BE) + nameUTF8        (0 => payload is a multi-file bundle/zip)
- *   [if keyMode == EMBEDDED: pwLen(2 BE) + pw bytes]
- *   payload  (= ciphertext||tag when encrypted, else plaintext)
+ * <pre>
+ * magic(5 "SGBX3") ver(1) carrier(1) cipher(1) keyMode(1) iters(4 BE)
+ * salt(16) nonce(12) payloadLen(8 BE) sha256(32)
+ * nameLen(2 BE) + nameUTF8            (0 =&gt; payload is a multi-file bundle/ZIP)
+ * [if keyMode == EMBEDDED: pwLen(2 BE) + password]
+ * payload                             (= ciphertext||tag, or plaintext when unencrypted)
+ * </pre>
  *
- * keyMode:
- *   NONE      -> no encryption (cipher must be NONE); SHA-256 only
- *   PASSWORD  -> receiver types the password ("手动输入")
- *   EMBEDDED  -> password stored in the file; receiver needs no input ("自动输入")
+ * keyMode: NONE (no encryption) / PASSWORD (receiver types it) / EMBEDDED (stored in the file).
+ *
+ * <p>The header layout is shared by the in-memory path ({@link #serialize()}) and the streaming
+ * path ({@link #headerBytes}) so both produce byte-identical envelopes.
  */
 public final class Envelope {
 
@@ -36,6 +39,58 @@ public final class Envelope {
     public static final int KEY_EMBEDDED = 2;   // stored in the file (no security)
 
     public static final int DEFAULT_ITERS = 200000;
+
+    /** AEAD tag size in bytes (128-bit MAC), i.e. ciphertext = plaintext + TAG_LEN. */
+    public static final int TAG_LEN = 16;
+
+    /**
+     * Length of the stored payload for a given plaintext length.
+     * The header field {@code payloadLen} always describes the CIPHERTEXT (see {@link #parse}).
+     */
+    public static long payloadLengthFor(int cipher, long plaintextLen) {
+        return cipher == Crypto.NONE ? plaintextLen : plaintextLen + TAG_LEN;
+    }
+
+    /** Size of the fixed part of the header, before the variable name / password blocks. */
+    public static final int FIXED_HEADER =
+            5 + 1 + 1 + 1 + 1 + 4 + 16 + 12 + 8 + 32;   // = 81
+
+    /** Parsed header fields (no payload). */
+    public static final class Fields {
+        public final int carrier, cipher, keyMode, iters;
+        public final byte[] salt, nonce, hash;
+        public final String name;
+        public final String embeddedPassword;
+        public final long payloadLen;
+
+        Fields(int carrier, int cipher, int keyMode, int iters, byte[] salt, byte[] nonce,
+               byte[] hash, String name, String embeddedPassword, long payloadLen) {
+            this.carrier = carrier;
+            this.cipher = cipher;
+            this.keyMode = keyMode;
+            this.iters = iters;
+            this.salt = salt;
+            this.nonce = nonce;
+            this.hash = hash;
+            this.name = name;
+            this.embeddedPassword = embeddedPassword;
+            this.payloadLen = payloadLen;
+        }
+
+        public boolean isBundle() {
+            return name == null || name.isEmpty();
+        }
+
+        /** AAD binds the header fields to the ciphertext. */
+        public byte[] aad() {
+            return Envelope.aad(carrier, cipher, keyMode, iters);
+        }
+
+        public byte[] keyFor(String userPassword) {
+            String pw = (keyMode == KEY_EMBEDDED) ? embeddedPassword : userPassword;
+            return Envelope.derive(cipher, keyMode, pw, salt, iters);
+        }
+    }
 
     public final int carrier, cipher, keyMode, iters;
     public final byte[] salt, nonce, hash, payload;
@@ -55,6 +110,120 @@ public final class Envelope {
         this.payloadName = payloadName;
         this.payload = payload;
         this.embeddedPassword = embeddedPassword;
+    }
+
+    // ------------------------------------------------------------------ header bytes
+
+    /** Serialises only the header, for a payload of exactly {@code payloadLen} bytes. */
+    public static byte[] headerBytes(int carrier, int cipher, int keyMode, int iters,
+                                     byte[] salt, byte[] nonce, long payloadLen, byte[] hash,
+                                     String name, String embeddedPassword) {
+        ByteArrayOutputStream o = new ByteArrayOutputStream();
+        o.write(MAGIC, 0, MAGIC.length);
+        o.write(VERSION);
+        o.write(carrier);
+        o.write(cipher);
+        o.write(keyMode);
+        writeInt(o, iters);
+        o.write(salt, 0, salt.length);
+        o.write(nonce, 0, nonce.length);
+        writeLong(o, payloadLen);
+        o.write(hash, 0, hash.length);
+        byte[] nm = (name == null ? "" : name).getBytes(StandardCharsets.UTF_8);
+        o.write((nm.length >>> 8) & 0xFF);
+        o.write(nm.length & 0xFF);
+        o.write(nm, 0, nm.length);
+        if (keyMode == KEY_EMBEDDED) {
+            byte[] p = (embeddedPassword == null ? "" : embeddedPassword).getBytes(StandardCharsets.UTF_8);
+            o.write((p.length >>> 8) & 0xFF);
+            o.write(p.length & 0xFF);
+            o.write(p, 0, p.length);
+        }
+        return o.toByteArray();
+    }
+
+    /** Parsed header together with the number of bytes it occupied in the stream. */
+    public static final class Header {
+        public final Fields fields;
+        public final int headerLength;
+
+        Header(Fields fields, int headerLength) {
+            this.fields = fields;
+            this.headerLength = headerLength;
+        }
+    }
+
+    /**
+     * Reads exactly one header from the stream (magic .. optional name / password blocks) and
+     * parses it. The stream is left positioned at the first payload byte.
+     */
+    public static Header readHeader(InputStream in) throws IOException {
+        byte[] fixed = readFully(in, FIXED_HEADER);              // 81 bytes, includes payloadLen
+        int keyMode = fixed[8] & 0xFF;
+
+        byte[] nameLenB = readFully(in, 2);
+        int nameLen = ((nameLenB[0] & 0xFF) << 8) | (nameLenB[1] & 0xFF);
+        byte[] name = nameLen > 0 ? readFully(in, nameLen) : new byte[0];
+
+        byte[] pwLenB = null, pw = new byte[0];
+        if (keyMode == KEY_EMBEDDED) {
+            pwLenB = readFully(in, 2);
+            int pwLen = ((pwLenB[0] & 0xFF) << 8) | (pwLenB[1] & 0xFF);
+            if (pwLen > 0) pw = readFully(in, pwLen);
+        }
+
+        ByteArrayOutputStream o = new ByteArrayOutputStream();
+        o.write(fixed, 0, fixed.length);
+        o.write(nameLenB, 0, 2);
+        o.write(name, 0, name.length);
+        if (pwLenB != null) {
+            o.write(pwLenB, 0, 2);
+            o.write(pw, 0, pw.length);
+        }
+        byte[] head = o.toByteArray();
+        Fields f = readFields(head, 0);
+        if (f == null) return null;
+        return new Header(f, head.length);
+    }
+
+    private static byte[] readFully(InputStream in, int n) throws IOException {
+        byte[] b = new byte[n];
+        int off = 0;
+        while (off < n) {
+            int r = in.read(b, off, n - off);
+            if (r < 0) throw new IOException("数据不完整");
+            off += r;
+        }
+        return b;
+    }
+
+    public static Fields readFields(byte[] d, int off) {
+        int p = off;
+        for (int i = 0; i < MAGIC.length; i++) {
+            if (d[p + i] != MAGIC[i]) return null;
+        }
+        p += MAGIC.length;
+        int ver = d[p++] & 0xFF;
+        if (ver != VERSION) return null;
+        int carrier = d[p++] & 0xFF;
+        int cipher = d[p++] & 0xFF;
+        int keyMode = d[p++] & 0xFF;
+        int iters = readInt(d, p); p += 4;
+        byte[] salt = slice(d, p, Crypto.SALT_LEN); p += Crypto.SALT_LEN;
+        byte[] nonce = slice(d, p, Crypto.NONCE_LEN); p += Crypto.NONCE_LEN;
+        long len = readLong(d, p); p += 8;
+        byte[] hash = slice(d, p, 32); p += 32;
+        int nameLen = ((d[p] & 0xFF) << 8) | (d[p + 1] & 0xFF); p += 2;
+        String name = nameLen == 0 ? null : new String(d, p, nameLen, StandardCharsets.UTF_8);
+        p += nameLen;
+        String pw = null;
+        if (keyMode == KEY_EMBEDDED) {
+            int n = ((d[p] & 0xFF) << 8) | (d[p + 1] & 0xFF); p += 2;
+            pw = new String(d, p, n, StandardCharsets.UTF_8);
+            p += n;
+        }
+        if (len < 0) return null;
+        return new Fields(carrier, cipher, keyMode, iters, salt, nonce, hash, name, pw, len);
     }
 
     // ------------------------------------------------------------------ build / open
@@ -96,7 +265,7 @@ public final class Envelope {
         return Kdf.pbkdf2(pw == null ? "" : pw, salt, iters, Crypto.keyBits(cipher));
     }
 
-    private static byte[] aad(int carrier, int cipher, int keyMode, int iters) {
+    public static byte[] aad(int carrier, int cipher, int keyMode, int iters) {
         ByteArrayOutputStream o = new ByteArrayOutputStream();
         o.write(MAGIC, 0, MAGIC.length);
         o.write(VERSION);
@@ -110,58 +279,27 @@ public final class Envelope {
     // ------------------------------------------------------------------ serialization
 
     public byte[] serialize() {
-        ByteArrayOutputStream o = new ByteArrayOutputStream();
-        o.write(MAGIC, 0, MAGIC.length);
-        o.write(VERSION);
-        o.write(carrier);
-        o.write(cipher);
-        o.write(keyMode);
-        writeInt(o, iters);
-        o.write(salt, 0, salt.length);
-        o.write(nonce, 0, nonce.length);
-        writeLong(o, payload.length);
-        o.write(hash, 0, hash.length);
-        byte[] nm = (payloadName == null ? "" : payloadName).getBytes(StandardCharsets.UTF_8);
-        o.write((nm.length >>> 8) & 0xFF);
-        o.write(nm.length & 0xFF);
-        o.write(nm, 0, nm.length);
-        if (keyMode == KEY_EMBEDDED) {
-            byte[] p = (embeddedPassword == null ? "" : embeddedPassword).getBytes(StandardCharsets.UTF_8);
-            o.write((p.length >>> 8) & 0xFF);
-            o.write(p.length & 0xFF);
-            o.write(p, 0, p.length);
-        }
-        o.write(payload, 0, payload.length);
-        return o.toByteArray();
+        byte[] head = headerBytes(carrier, cipher, keyMode, iters, salt, nonce,
+                payload.length, hash, payloadName,
+                keyMode == KEY_EMBEDDED ? embeddedPassword : null);
+        byte[] out = new byte[head.length + payload.length];
+        System.arraycopy(head, 0, out, 0, head.length);
+        System.arraycopy(payload, 0, out, head.length, payload.length);
+        return out;
     }
 
+    /** Parse an envelope (header + inline payload) starting at {@code off}. */
     public static Envelope parse(byte[] d, int off) {
         try {
-            int p = off;
-            for (int i = 0; i < MAGIC.length; i++) if (d[p + i] != MAGIC[i]) return null;
-            p += MAGIC.length;
-            int ver = d[p++] & 0xFF;
-            if (ver != VERSION) return null;
-            int carrier = d[p++] & 0xFF;
-            int cipher = d[p++] & 0xFF;
-            int keyMode = d[p++] & 0xFF;
-            int iters = readInt(d, p); p += 4;
-            byte[] salt = slice(d, p, Crypto.SALT_LEN); p += Crypto.SALT_LEN;
-            byte[] nonce = slice(d, p, Crypto.NONCE_LEN); p += Crypto.NONCE_LEN;
-            long len = readLong(d, p); p += 8;
-            byte[] hash = slice(d, p, 32); p += 32;
-            int nameLen = ((d[p] & 0xFF) << 8) | (d[p + 1] & 0xFF); p += 2;
-            String name = nameLen == 0 ? null : new String(d, p, nameLen, StandardCharsets.UTF_8);
-            p += nameLen;
-            String pw = null;
-            if (keyMode == KEY_EMBEDDED) {
-                int n = ((d[p] & 0xFF) << 8) | (d[p + 1] & 0xFF); p += 2;
-                pw = new String(d, p, n, StandardCharsets.UTF_8); p += n;
-            }
-            if (len < 0 || p + len > d.length) return null;
-            byte[] payload = slice(d, p, (int) len);
-            return new Envelope(carrier, cipher, keyMode, iters, salt, nonce, hash,
-                    name, payload, pw);
+            Fields f = readFields(d, off);
+            if (f == null) return null;
+            int headLen = headerBytes(f.carrier, f.cipher, f.keyMode, f.iters, f.salt, f.nonce,
+                    f.payloadLen, f.hash, f.name, f.embeddedPassword).length;
+            int start = off + headLen;
+            if (f.payloadLen < 0 || start + f.payloadLen > d.length) return null;
+            byte[] payload = slice(d, start, (int) f.payloadLen);
+            return new Envelope(f.carrier, f.cipher, f.keyMode, f.iters, f.salt, f.nonce, f.hash,
+                    f.name, payload, f.embeddedPassword);
         } catch (Exception e) {
             return null;
         }

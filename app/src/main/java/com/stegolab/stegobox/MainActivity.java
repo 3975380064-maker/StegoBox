@@ -41,6 +41,7 @@ import androidx.appcompat.app.AppCompatActivity;
 import androidx.documentfile.provider.DocumentFile;
 
 import com.stegolab.stegobox.container.Envelope;
+import com.stegolab.stegobox.container.StreamContainer;
 import com.stegolab.stegobox.crypto.Crypto;
 import com.stegolab.stegobox.crypto.Kdf;
 import com.stegolab.stegobox.stego.LsbStego;
@@ -48,18 +49,27 @@ import com.stegolab.stegobox.stego.Steganalysis;
 import com.stegolab.stegobox.stego.TailAppend;
 import com.stegolab.stegobox.util.ZipUtil;
 
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.security.DigestOutputStream;
+import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 
 public class MainActivity extends AppCompatActivity {
 
@@ -95,6 +105,18 @@ public class MainActivity extends AppCompatActivity {
     private Uri outDirUri;
     private byte[] lastHash;
     private Steganalysis.Result lastAnalysis;
+
+    // streaming (tail-append) job state
+    private File pTemp;              // plaintext staged on disk while hiding
+    private byte[] pHeader;          // serialized header for the streaming write
+    private byte[] pKey, pNonce;
+    private byte[] pHash;
+    private long pPlainLen;
+
+    // streaming extract state (tail-append carrier)
+    private File xTemp;              // decrypted plaintext staged on disk
+    private String xName;            // original payload name, null => bundle
+    private int xKeyMode = -1;
 
     private Uri coverUri;
     private final List<Uri> fileUris = new ArrayList<>();
@@ -281,8 +303,12 @@ public class MainActivity extends AppCompatActivity {
         setBusy(true, "读取内容…");
         new Thread(() -> {
             try {
-                buildPlain(textPayload);                            // heavy I/O -> never on UI thread
-                if (pCarrier == Envelope.CARRIER_LSB) checkLsbCapacity();
+                if (pCarrier == Envelope.CARRIER_APPEND) {
+                    buildPlainStreaming(textPayload);               // staged on disk, O(1) memory
+                } else {
+                    buildPlain(textPayload);                        // LSB: bounded by capacity
+                    checkLsbCapacity();
+                }
 
                 ui(() -> {
                     try {
@@ -349,6 +375,90 @@ public class MainActivity extends AppCompatActivity {
             pPlain = ZipUtil.zip(names.toArray(new String[0]), datas.toArray(new byte[0][]));
             pName = null;                                            // bundle => 还原成多个文件
         }
+        pPlainLen = pPlain.length;
+    }
+
+    // ---------------------------------------------------------------- streaming hide
+
+    /**
+     * Stages the payload into a cache file while hashing it, so the payload never has to fit in
+     * memory. Single item = raw copy, anything else = streamed ZIP with de-duplicated names.
+     */
+    private void buildPlainStreaming(String textPayload) throws Exception {
+        File tmp = new File(getCacheDir(), "sb_payload.tmp");
+        if (tmp.exists() && !tmp.delete()) throw new IOException("无法清理临时文件");
+
+        boolean zip = !(textPayload.isEmpty() && fileUris.size() == 1);
+        MessageDigest md = MessageDigest.getInstance("SHA-256");
+        DigestOutputStream dos = new DigestOutputStream(
+                new BufferedOutputStream(new FileOutputStream(tmp), 64 * 1024), md);
+        try {
+            if (zip) {
+                ZipOutputStream z = new ZipOutputStream(dos);
+                Set<String> used = new HashSet<>();
+                if (!textPayload.isEmpty()) {
+                    String n = ZipUtil.uniqueName("message.txt", used);
+                    z.putNextEntry(new ZipEntry(n));
+                    z.write(textPayload.getBytes("UTF-8"));
+                    z.closeEntry();
+                }
+                for (Uri u : fileUris) {
+                    String n = ZipUtil.uniqueName(ZipUtil.safe(nameOf(u)), used);
+                    z.putNextEntry(new ZipEntry(n));
+                    try (InputStream in = getContentResolver().openInputStream(u)) {
+                        if (in == null) throw new IOException("无法读取 " + n);
+                        Crypto.pipe(in, z);
+                    }
+                    z.closeEntry();
+                }
+                z.finish();
+                pName = null;                                        // bundle
+            } else {
+                try (InputStream in = getContentResolver().openInputStream(fileUris.get(0))) {
+                    if (in == null) throw new IOException("无法读取封面载荷");
+                    Crypto.pipe(in, dos);
+                }
+                pName = nameOf(fileUris.get(0));
+            }
+        } finally {
+            dos.flush();
+            dos.close();
+        }
+        pTemp = tmp;
+        pPlainLen = tmp.length();
+        pHash = md.digest();
+        makeAppendHeader();
+    }
+
+    /** Builds the header + key/nonce for the streamed payload. */
+    private void makeAppendHeader() {
+        SecureRandom r = new SecureRandom();
+        byte[] salt = new byte[Crypto.SALT_LEN];
+        r.nextBytes(salt);
+        pNonce = new byte[Crypto.NONCE_LEN];
+        r.nextBytes(pNonce);
+        pKey = (pCipher == Crypto.NONE)
+                ? new byte[0]
+                : Kdf.pbkdf2(pPw == null ? "" : pPw, salt, Envelope.DEFAULT_ITERS, Crypto.keyBits(pCipher));
+        pHeader = Envelope.headerBytes(pCarrier, pCipher, pEnvKeyMode, Envelope.DEFAULT_ITERS,
+                salt, pNonce, Envelope.payloadLengthFor(pCipher, pTemp.length()), pHash, pName,
+                pEnvKeyMode == Envelope.KEY_EMBEDDED ? pPw : null);
+        lastHash = pHash;
+    }
+
+    /** Cover bytes + header + sealed payload, written straight to {@code out}. */
+    private void writeAppendToStream(OutputStream out) throws Exception {
+        try (InputStream cs = getContentResolver().openInputStream(coverUri)) {
+            if (cs == null) throw new IOException("无法读取封面图片");
+            Crypto.pipe(cs, out);
+        }
+        StreamContainer.sealFileTo(out, pHeader, pCipher, pKey, pNonce,
+                Envelope.aad(pCarrier, pCipher, pEnvKeyMode, Envelope.DEFAULT_ITERS), pTemp);
+    }
+
+    /** Bytes added after the cover (header + ciphertext). */
+    private long appendedSize() {
+        return pHeader.length + Envelope.payloadLengthFor(pCipher, pPlainLen);
     }
 
     // ---------------------------------------------------------------- activity result
@@ -428,16 +538,28 @@ public class MainActivity extends AppCompatActivity {
                 break;
             case REQ_OUT_FILE:
                 try {
-                    writeTo(uri, extractedPayload);
+                    if (xTemp != null) {
+                        try (OutputStream os = getContentResolver().openOutputStream(uri)) {
+                            if (os == null) throw new IOException("无法打开输出流");
+                            copyTempTo(os);
+                        }
+                        log("已还原 → " + nameOf(uri) + "（" + xTemp.length() + " 字节）");
+                    } else {
+                        writeTo(uri, extractedPayload);
+                        log("已还原文件 → " + nameOf(uri) + "（" + extractedPayload.length + " 字节）");
+                    }
                     setBusy(false, null);
                     toast("提取完成 ✓");
-                    log("已还原文件 → " + nameOf(uri) + "（" + extractedPayload.length + " 字节）");
                 } catch (Throwable t) {
                     fail("保存失败", t);
                 }
                 break;
             case REQ_OUT_DIR:
-                restoreBundle(uri);
+                if (xTemp != null) {
+                    restoreTempBundleIntoTree(DocumentFile.fromTreeUri(this, uri));
+                } else {
+                    restoreBundle(uri);
+                }
                 break;
             case REQ_PICK_DIR:
                 try {
@@ -475,7 +597,7 @@ public class MainActivity extends AppCompatActivity {
             log("隐藏成功。载体=" + (pCarrier == Envelope.CARRIER_APPEND ? "尾部追加" : "像素LSB")
                     + " | 算法=" + Crypto.name(pCipher)
                     + " | 接收=" + (pEnvKeyMode == Envelope.KEY_EMBEDDED ? "自动输入" : "手动输入"));
-            log("明文 " + pPlain.length + " 字节 | SHA-256 " + Kdf.hex(lastHash).substring(0, 16) + "…");
+            log("明文 " + pPlainLen + " 字节 | SHA-256 " + Kdf.hex(lastHash).substring(0, 16) + "…");
             log("输出：" + where);
             if (pCarrier == Envelope.CARRIER_LSB) {
                 if (lastAnalysis == null) {
@@ -500,9 +622,17 @@ public class MainActivity extends AppCompatActivity {
     private void performHide(Uri outUri) {
         new Thread(() -> {
             try {
-                byte[] out = computeHideOutput();
-                writeTo(outUri, out);
-                logHideOk("已保存（" + out.length + " 字节）");
+                if (pCarrier == Envelope.CARRIER_APPEND) {
+                    try (OutputStream os = getContentResolver().openOutputStream(outUri)) {
+                        if (os == null) throw new IOException("无法打开输出流");
+                        writeAppendToStream(os);
+                    }
+                    logHideOk("已保存（追加 " + appendedSize() + " 字节）");
+                } else {
+                    byte[] out = computeHideOutput();
+                    writeTo(outUri, out);
+                    logHideOk("已保存（" + out.length + " 字节）");
+                }
             } catch (Throwable t) {
                 fail("隐藏失败", t);
             }
@@ -512,9 +642,13 @@ public class MainActivity extends AppCompatActivity {
     private void performHideToDir() {
         new Thread(() -> {
             try {
-                byte[] out = computeHideOutput();
-                String where = writeIntoFixedDir("stegobox_out.png", "image/png", out);
-                logHideOk(where + "（" + out.length + " 字节）");
+                if (pCarrier == Envelope.CARRIER_APPEND) {
+                    logHideOk(writeAppendToFixedDir() + "（追加 " + appendedSize() + " 字节）");
+                } else {
+                    byte[] out = computeHideOutput();
+                    String where = writeIntoFixedDir("stegobox_out.png", "image/png", out);
+                    logHideOk(where + "（" + out.length + " 字节）");
+                }
             } catch (Throwable t) {
                 fail("隐藏失败", t);
             }
@@ -524,14 +658,44 @@ public class MainActivity extends AppCompatActivity {
     private void performHideDirect() {
         new Thread(() -> {
             try {
-                byte[] out = computeHideOutput();
-                File f = directOutFile("stegobox_out.png");
-                writeFile(f, out);
-                logHideOk(f.getAbsolutePath() + "（" + out.length + " 字节）");
+                if (pCarrier == Envelope.CARRIER_APPEND) {
+                    File f = directOutFile("stegobox_out.png");
+                    try (OutputStream os = StreamContainer.openFileOutput(f)) {
+                        writeAppendToStream(os);
+                    }
+                    logHideOk(f.getAbsolutePath() + "（追加 " + appendedSize() + " 字节）");
+                } else {
+                    byte[] out = computeHideOutput();
+                    File f = directOutFile("stegobox_out.png");
+                    writeFile(f, out);
+                    logHideOk(f.getAbsolutePath() + "（" + out.length + " 字节）");
+                }
             } catch (Throwable t) {
                 fail("隐藏失败", t);
             }
         }).start();
+    }
+
+    /** Streaming variant of {@link #writeIntoFixedDir} for the tail-append carrier. */
+    private String writeAppendToFixedDir() throws Exception {
+        String name = "stegobox_out.png";
+        if (canWriteDirect()) {
+            File dir = treeUriToFile(outDirUri);
+            if (dir != null && (dir.exists() || dir.mkdirs())) {
+                File f = new File(dir, name);
+                if (f.exists()) f.delete();
+                try (OutputStream os = StreamContainer.openFileOutput(f)) {
+                    writeAppendToStream(os);
+                }
+                return f.getAbsolutePath();
+            }
+        }
+        Uri u = newFileInFixedDir(name, "image/png");
+        try (OutputStream os = getContentResolver().openOutputStream(u)) {
+            if (os == null) throw new IOException("无法打开输出流");
+            writeAppendToStream(os);
+        }
+        return "固定目录 / " + name;
     }
 
     // ---------------------------------------------------------------- extract / restore
@@ -540,6 +704,20 @@ public class MainActivity extends AppCompatActivity {
         String pw = editPassword.getText().toString();
         new Thread(() -> {
             try {
+                // ---- try the streaming tail-append path first (O(1) memory) ----
+                long at = -1;
+                try (InputStream scan = getContentResolver().openInputStream(stegoUri)) {
+                    if (scan != null) {
+                        at = StreamContainer.findLastEnvelopeOffset(scan, Envelope.MAGIC);
+                    }
+                } catch (Throwable ignored) {
+                }
+                if (at >= 0) {
+                    extractAppendStreaming(stegoUri, at, pw);
+                    return;
+                }
+
+                // ---- otherwise: legacy in-memory path (pixel LSB) ----
                 byte[] data = readAll(stegoUri);
 
                 Envelope env = Envelope.findEnvelope(data);
@@ -608,6 +786,224 @@ public class MainActivity extends AppCompatActivity {
                 }
             } catch (Throwable t) {
                 fail("提取失败", t);
+            }
+        }).start();
+    }
+
+    // ---------------------------------------------------------------- streaming extract
+
+    /** Decrypts the trailing envelope straight to a cache file, then places it. O(1) memory. */
+    private void extractAppendStreaming(Uri stegoUri, long at, String pw) throws Exception {
+        Envelope.Fields f;
+        try (InputStream in = getContentResolver().openInputStream(stegoUri)) {
+            if (in == null) throw new IOException("无法打开图片");
+            StreamContainer.awaitFully(in, at);
+            Envelope.Header h = Envelope.readHeader(in);
+            if (h == null) throw new IllegalArgumentException("未找到有效的 StegoBox 头");
+            f = h.fields;
+        }
+
+        File tmp = new File(getCacheDir(), "sb_plain.tmp");
+        if (tmp.exists() && !tmp.delete()) throw new IOException("无法清理临时文件");
+        MessageDigest md = MessageDigest.getInstance("SHA-256");
+        byte[] key = f.keyFor(pw);
+        try (InputStream in = getContentResolver().openInputStream(stegoUri)) {
+            if (in == null) throw new IOException("无法打开图片");
+            StreamContainer.awaitFully(in, at);
+            Envelope.readHeader(in);                      // skip the header again
+            try (DigestOutputStream dos = new DigestOutputStream(
+                    new BufferedOutputStream(new FileOutputStream(tmp), 64 * 1024), md)) {
+                Crypto.openStream(f.cipher, key, f.nonce, f.aad(), in, dos);
+            }
+        }
+        if (!Arrays.equals(md.digest(), f.hash)) throw new SecurityException("SHA-256 完整性校验失败");
+
+        xTemp = tmp;
+        xName = f.isBundle() ? null : f.name;
+        xKeyMode = f.keyMode;
+        final long len = tmp.length();
+        ui(() -> {
+            log("发现载荷 —— 尾部追加 | " + Crypto.name(f.cipher) + " | " + keyModeName(f.keyMode));
+            log("SHA-256 校验通过，明文 " + len + " 字节。");
+        });
+        placeExtractedAppend();
+    }
+
+    /** Where should the staged plaintext go? Same priority as hiding: chosen dir → direct → ask. */
+    private void placeExtractedAppend() {
+        final boolean bundle = (xName == null);
+
+        if (fixedDirActive()) {
+            File dir = canWriteDirect() ? treeUriToFile(outDirUri) : null;
+            if (dir != null) {
+                if (bundle) {
+                    ui(() -> log("多文件包，正在还原到指定目录…"));
+                    restoreTempBundleIntoFile(dir);
+                } else {
+                    File f = new File(dir, xName);
+                    try {
+                        if (f.exists()) f.delete();
+                        copyTempToFile(f);
+                        ui(() -> {
+                            log("已还原 → " + f.getAbsolutePath() + "（" + xTemp.length() + " 字节）");
+                            toast("提取完成 ✓");
+                            setBusy(false, null);
+                        });
+                    } catch (Throwable t) {
+                        fail("还原失败", t);
+                    }
+                }
+            } else if (bundle) {
+                ui(() -> log("多文件包，正在还原到指定目录…"));
+                restoreTempBundleIntoTree(DocumentFile.fromTreeUri(this, outDirUri));
+            } else {
+                try {
+                    Uri u = newFileInFixedDir(xName, mimeOf(xName));
+                    try (OutputStream os = getContentResolver().openOutputStream(u)) {
+                        if (os == null) throw new IOException("无法打开输出流");
+                        copyTempTo(os);
+                    }
+                    ui(() -> {
+                        log("已还原 → 固定目录 / " + xName + "（" + xTemp.length() + " 字节）");
+                        toast("提取完成 ✓");
+                        setBusy(false, null);
+                    });
+                } catch (Throwable t) {
+                    fail("还原失败", t);
+                }
+            }
+            return;
+        }
+
+        if (canWriteDirect()) {
+            File root = directOutRoot();
+            if (bundle) {
+                ui(() -> log("多文件包，正在还原…"));
+                restoreTempBundleIntoFile(root);
+            } else {
+                try {
+                    File f = new File(root, xName);
+                    if (f.exists()) f.delete();
+                    copyTempToFile(f);
+                    ui(() -> {
+                        log("已还原 → " + f.getAbsolutePath() + "（" + xTemp.length() + " 字节）");
+                        toast("提取完成 ✓");
+                        setBusy(false, null);
+                    });
+                } catch (Throwable t) {
+                    fail("还原失败", t);
+                }
+            }
+            return;
+        }
+
+        ui(() -> {
+            if (bundle) {
+                log("多文件包，请选择保存目录以还原。");
+                Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+                startActivityForResult(i, REQ_OUT_DIR);
+            } else {
+                Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+                i.addCategory(Intent.CATEGORY_OPENABLE);
+                i.setType(mimeOf(xName));
+                i.putExtra(Intent.EXTRA_TITLE, xName);
+                startActivityForResult(i, REQ_OUT_FILE);
+            }
+        });
+    }
+
+    private void copyTempToFile(File f) throws Exception {
+        File p = f.getParentFile();
+        if (p != null && !p.exists() && !p.mkdirs()) throw new IOException("无法创建目录");
+        try (OutputStream os = new BufferedOutputStream(new FileOutputStream(f), 64 * 1024)) {
+            copyTempTo(os);
+        }
+    }
+
+    private void copyTempTo(OutputStream os) throws Exception {
+        try (InputStream in = new BufferedInputStream(new FileInputStream(xTemp), 64 * 1024)) {
+            Crypto.pipe(in, os);
+        }
+    }
+
+    /** Stream-unzips the staged bundle into a real directory. */
+    private void restoreTempBundleIntoFile(final File root) {
+        new Thread(() -> {
+            try {
+                int n = 0;
+                try (java.util.zip.ZipInputStream z = new java.util.zip.ZipInputStream(
+                        new BufferedInputStream(new FileInputStream(xTemp), 64 * 1024))) {
+                    java.util.zip.ZipEntry e;
+                    byte[] buf = new byte[64 * 1024];
+                    while ((e = z.getNextEntry()) != null) {
+                        if (e.isDirectory()) continue;
+                        String path = ZipUtil.safe(e.getName());
+                        if (path.isEmpty()) continue;
+                        File out = new File(root, path);
+                        File parent = out.getParentFile();
+                        if (parent != null && !parent.exists()) parent.mkdirs();
+                        try (OutputStream os = new BufferedOutputStream(new FileOutputStream(out), 64 * 1024)) {
+                            int r;
+                            while ((r = z.read(buf)) > 0) os.write(buf, 0, r);
+                        }
+                        n++;
+                    }
+                }
+                final int cnt = n;
+                ui(() -> {
+                    log("已还原 " + cnt + " 个文件到 " + root.getAbsolutePath());
+                    toast("提取完成 ✓");
+                    setBusy(false, null);
+                });
+            } catch (Throwable t) {
+                fail("还原失败", t);
+            }
+        }).start();
+    }
+
+    /** Stream-unzips the staged bundle into a SAF document tree. */
+    private void restoreTempBundleIntoTree(final DocumentFile root) {
+        new Thread(() -> {
+            try {
+                if (root == null) throw new IllegalArgumentException("无法访问所选目录");
+                int n = 0;
+                try (java.util.zip.ZipInputStream z = new java.util.zip.ZipInputStream(
+                        new BufferedInputStream(new FileInputStream(xTemp), 64 * 1024))) {
+                    java.util.zip.ZipEntry e;
+                    byte[] buf = new byte[64 * 1024];
+                    while ((e = z.getNextEntry()) != null) {
+                        if (e.isDirectory()) continue;
+                        String path = ZipUtil.safe(e.getName());
+                        if (path.isEmpty()) continue;
+                        String[] seg = path.split("/");
+                        DocumentFile dir = root;
+                        for (int i = 0; i < seg.length - 1; i++) {
+                            DocumentFile next = dir.findFile(seg[i]);
+                            if (next == null) next = dir.createDirectory(seg[i]);
+                            if (next == null) throw new IOException("无法创建目录 " + seg[i]);
+                            dir = next;
+                        }
+                        String fname = seg[seg.length - 1];
+                        DocumentFile old = dir.findFile(fname);
+                        if (old != null) old.delete();
+                        DocumentFile f = dir.createFile(mimeOf(fname), fname);
+                        if (f == null) throw new IOException("无法创建文件 " + fname);
+                        try (OutputStream os = getContentResolver().openOutputStream(f.getUri())) {
+                            if (os == null) throw new IOException("无法写入 " + fname);
+                            int r;
+                            while ((r = z.read(buf)) > 0) os.write(buf, 0, r);
+                        }
+                        n++;
+                    }
+                }
+                final int cnt = n;
+                ui(() -> {
+                    log("已还原 " + cnt + " 个文件。");
+                    toast("提取完成 ✓");
+                    setBusy(false, null);
+                });
+            } catch (Throwable t) {
+                fail("还原失败", t);
             }
         }).start();
     }
